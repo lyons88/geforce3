@@ -12,6 +12,7 @@
 #include "hw/qdev-properties.h"
 #include "hw/display/vga.h"
 #include "hw/display/vga_int.h"
+#include "hw/display/edid.h"
 #include "migration/vmstate.h"
 #include "qapi/error.h"
 
@@ -65,6 +66,10 @@ typedef struct NVGFState {
     /* DDC/I2C */
     DDCState ddc;
     
+    /* Dynamic EDID support */
+    qemu_edid_info edid_info;
+    uint8_t edid_blob[256];
+    
     /* Device registers */
     uint32_t pramdac_i2c[2];
     uint32_t enable_vga;
@@ -74,12 +79,24 @@ typedef struct NVGFState {
 /* DDC/I2C Implementation */
 static void geforce_ddc_init(NVGFState *s)
 {
-    /* Initialize DDC with static EDID */
-    s->ddc.edid = static_edid_data;
+    /* Initialize EDID info with default values */
+    s->edid_info.width_mm = 520;   /* 520mm = ~20.5 inches */
+    s->edid_info.height_mm = 320;  /* 320mm = ~12.6 inches (4:3 aspect) */
+    s->edid_info.prefx = 1024;     /* Default preferred resolution */
+    s->edid_info.prefy = 768;
+    s->edid_info.maxx = 1600;      /* Maximum supported resolution */
+    s->edid_info.maxy = 1200;
+    
+    /* Generate dynamic EDID */
+    qemu_edid_generate(s->edid_blob, sizeof(s->edid_blob), &s->edid_info);
+    
+    /* Initialize DDC with dynamic EDID */
+    s->ddc.edid = s->edid_blob;
     s->ddc.address = 0;
     s->ddc.reg = 0;
     
-    qemu_log_mask(LOG_TRACE, "GeForce3: DDC initialized with static EDID\n");
+    qemu_log_mask(LOG_TRACE, "GeForce3: DDC initialized with dynamic EDID (%dx%d)\n", 
+                  s->edid_info.prefx, s->edid_info.prefy);
 }
 
 static uint8_t geforce_ddc_read(DDCState *ddc)
@@ -176,6 +193,30 @@ static const MemoryRegionOps nv_vga_ops = {
     },
 };
 
+/* UI info callback for dynamic EDID updates */
+static void nv_ui_info(void *opaque, uint32_t idx, QemuUIInfo *info)
+{
+    NVGFState *s = opaque;
+    
+    if (info->width && info->height) {
+        /* Update EDID info with new display dimensions */
+        s->edid_info.prefx = info->width;
+        s->edid_info.prefy = info->height;
+        
+        /* Update physical dimensions if provided */
+        if (info->width_mm && info->height_mm) {
+            s->edid_info.width_mm = info->width_mm;
+            s->edid_info.height_mm = info->height_mm;
+        }
+        
+        /* Regenerate EDID with new info */
+        qemu_edid_generate(s->edid_blob, sizeof(s->edid_blob), &s->edid_info);
+        
+        qemu_log_mask(LOG_TRACE, "GeForce3: EDID updated to %dx%d\n", 
+                      s->edid_info.prefx, s->edid_info.prefy);
+    }
+}
+
 /* Device initialization */
 static void nv_realize(PCIDevice *pci_dev, Error **errp)
 {
@@ -204,6 +245,9 @@ static void nv_realize(PCIDevice *pci_dev, Error **errp)
     /* Create console */
     s->vga.con = graphic_console_init(DEVICE(pci_dev), 0, 
                                      &vga_ops, &s->vga);
+    
+    /* Register UI info callback for dynamic EDID */
+    dpy_set_ui_info(s->vga.con, nv_ui_info, s);
     
     qemu_log_mask(LOG_TRACE, "GeForce3: device realized\n");
 }
