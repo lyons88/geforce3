@@ -1,0 +1,28 @@
+# Build artifacts
+*.o
+*.so
+*.a
+*.lo
+*.la
+/tmp/
+
+# QEMU build files
+config-host.mak
+config-target.mak
+config-all-devices.mak
+*-softmmu/
+*-linux-user/
+
+# Editor files
+*~
+*.swp
+*.swo
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Test outputs
+test_output/
