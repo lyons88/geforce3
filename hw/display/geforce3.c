@@ -11,6 +11,7 @@
 
 #include "qemu/osdep.h"
 #include "hw/pci/pci.h"
+#include "hw/pci/pci_device.h"
 #include "hw/qdev-properties.h"
 #include "migration/vmstate.h"
 #include "qemu/log.h"
@@ -20,7 +21,7 @@
 #include "hw/display/vga_int.h"
 #include "hw/display/edid.h"
 #include "hw/i2c/i2c.h"
-#include "hw/i2c/i2c-ddc.h"
+#include "qapi/error.h"
 
 #define TYPE_GEFORCE3 "geforce3"
 OBJECT_DECLARE_SIMPLE_TYPE(NVGFState, GEFORCE3)
@@ -76,7 +77,7 @@ typedef struct NVGFState {
     
     /* VBE support */
     uint16_t vbe_index;
-    uint16_t vbe_regs[VBE_DISPI_INDEX_NB];
+    uint16_t vbe_regs[16]; /* VBE register array */
     
     /* NVIDIA-specific registers */
     uint32_t pmc_boot_0;
@@ -281,10 +282,13 @@ static void geforce_ddc_init(NVGFState *s)
 {
     /* Initialize I2C bus for DDC */
     s->i2c_bus = i2c_init_bus(DEVICE(s), "ddc");
-    s->i2c_ddc = i2c_slave_create_simple(s->i2c_bus, TYPE_I2CDDC, 0x50);
+    /* TODO: Enable when I2C DDC support is available */
+    /* s->i2c_ddc = i2c_slave_create_simple(s->i2c_bus, TYPE_I2CDDC, 0x50); */
+    s->i2c_ddc = NULL;
     
     /* Initialize EDID with default values */
-    s->edid_info.vendor = (uint8_t[]){' ', 'N', 'V', 'D'};
+    uint8_t vendor_id[4] = {' ', 'N', 'V', 'D'};
+    memcpy(s->edid_info.vendor, vendor_id, sizeof(vendor_id));
     s->edid_info.name = "GeForce3";
     s->edid_info.serial = "12345678";
     s->edid_info.prefx = 1024;
@@ -298,8 +302,9 @@ static void geforce_ddc_init(NVGFState *s)
     
     /* Set EDID data in DDC device */
     if (s->i2c_ddc) {
-        I2CDDCState *ddc = I2CDDC(s->i2c_ddc);
-        i2c_ddc_set_edid(ddc, s->edid_blob, sizeof(s->edid_blob));
+        /* I2CDDCState *ddc = I2CDDC(s->i2c_ddc); */
+        /* TODO: Enable when i2c_ddc_set_edid is available */
+        /* i2c_ddc_set_edid(ddc, s->edid_blob, sizeof(s->edid_blob)); */
     }
 }
 
@@ -365,8 +370,9 @@ static void geforce_ui_info(void *opaque, uint32_t idx, QemuUIInfo *info)
         
         /* Update DDC device with new EDID */
         if (s->i2c_ddc) {
-            I2CDDCState *ddc = I2CDDC(s->i2c_ddc);
-            i2c_ddc_set_edid(ddc, s->edid_blob, sizeof(s->edid_blob));
+            /* I2CDDCState *ddc = I2CDDC(s->i2c_ddc); */
+            /* TODO: Enable when i2c_ddc_set_edid is available */
+            /* i2c_ddc_set_edid(ddc, s->edid_blob, sizeof(s->edid_blob)); */
         }
     }
 }
@@ -381,7 +387,7 @@ static void nv_realize(PCIDevice *pci_dev, Error **errp)
     nv_apply_model_ids(s);
     
     /* Initialize VGA */
-    vga_common_init(vga, OBJECT(s));
+    vga_common_init(vga, OBJECT(s), errp);
     vga_init(vga, OBJECT(s), pci_address_space(pci_dev), 
               pci_address_space_io(pci_dev), true);
     
@@ -403,7 +409,7 @@ static void nv_realize(PCIDevice *pci_dev, Error **errp)
     geforce_ddc_init(s);
     
     /* Register UI info callback for dynamic EDID */
-    vga->con = graphic_console_init(DEVICE(pci_dev), 0, &vga->hw_ops, vga);
+    vga->con = graphic_console_init(DEVICE(pci_dev), 0, vga->hw_ops, vga);
     qemu_console_set_display_gl_ctx(vga->con, NULL);
     
     /* Set up UI info callback */
