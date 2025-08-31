@@ -2,7 +2,7 @@
 # This file integrates the GeForce3 device with QEMU's meson build system
 
 geforce3_ss = ss.source_set()
-geforce3_ss.add(files('geforce3.c'))
+geforce3_ss.add(files('hw/display/geforce3.c'))
 
 # Add dependencies
 geforce3_ss.add(hw_display)

@@ -454,4 +454,4 @@ static void geforce3_register_types(void)
     type_register_static(&geforce3_info);
 }
 
-type_init(geforce3_register_types)
+type_init(geforce3_register_types);

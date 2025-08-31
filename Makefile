@@ -2,7 +2,7 @@
 # This file is for integration with QEMU build system
 
 # Source files
-SOURCES = geforce3.c
+SOURCES = hw/display/geforce3.c
 
 # Object files  
 OBJECTS = $(SOURCES:.c=.o)
@@ -25,7 +25,7 @@ clean:
 	rm -f $(OBJECTS)
 
 # Syntax check
-check: geforce3.c
-	gcc $(CFLAGS) -fsyntax-only geforce3.c
+check: hw/display/geforce3.c
+	gcc $(CFLAGS) -fsyntax-only hw/display/geforce3.c
 
 .PHONY: all clean check
