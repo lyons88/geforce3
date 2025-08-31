@@ -237,8 +237,9 @@ static void geforce3_init_edid(Geforce3State *s)
     /* Initialize EDID structure */
     memset(&s->edid_info, 0, sizeof(s->edid_info));
     
-    /* This line has the compilation error #1 - passing const char* to void* */
-    memcpy(s->edid_info.vendor, vendor_id, sizeof(vendor_id));
+    /* Fix memcpy vendor assignment - use strncpy for string copying */
+    strncpy(s->edid_info.vendor, vendor_id, sizeof(s->edid_info.vendor) - 1);
+    s->edid_info.vendor[sizeof(s->edid_info.vendor) - 1] = '\0';
     
     s->edid_info.product[0] = 0x00;
     s->edid_info.product[1] = 0x02; /* GeForce3 */
@@ -301,9 +302,9 @@ static void geforce3_realize(PCIDevice *dev, Error **errp)
     /* Initialize EDID */
     geforce3_init_edid(s);
     
-    /* Set up UI info callback - this line has compilation error #2 */
+    /* Set up UI info callback - use dpy_set_ui_info instead of qemu_console_set_ui_info */
     if (s->con) {
-        qemu_console_set_ui_info(vga->con, geforce_ui_info, s);
+        dpy_set_ui_info(vga->con, geforce_ui_info, s);
     }
     
     /* Clear registers */
@@ -324,15 +325,15 @@ static void geforce3_class_init(ObjectClass *klass, const void *data)
     pc->revision = GEFORCE3_REVISION;
     pc->class_id = GEFORCE3_CLASS_CODE;
     
-    /* This line has compilation error #3 - no 'reset' member in DeviceClass */
-    dc->reset = vga_common_reset;
+    /* Modern QEMU uses unrealize instead of reset for cleanup */
+    dc->unrealize = NULL; /* No specific unrealize needed for basic device */
     
     dc->vmsd = &vmstate_geforce3;
     set_bit(DEVICE_CATEGORY_DISPLAY, dc->categories);
 }
 
-/* This function signature has compilation error #4 - wrong signature */
-static void nv_class_init(ObjectClass *klass, void *data)
+/* Fix function signature - data parameter should be const void* */
+static void nv_class_init(ObjectClass *klass, const void *data)
 {
     geforce3_class_init(klass, data);
 }
