@@ -20,6 +20,7 @@
 #include "hw/display/vga.h"
 #include "hw/display/vga_int.h"
 #include "hw/display/edid.h"
+#include "hw/display/bochs-vbe.h"
 #include "hw/i2c/i2c.h"
 #include "qapi/error.h"
 #include "ui/console.h"
@@ -294,8 +295,9 @@ static void geforce_ddc_init(NVGFState *s)
     s->edid_info.serial = "12345678";
     s->edid_info.prefx = 1024;
     s->edid_info.prefy = 768;
-    s->edid_info.maxx = 1600;
-    s->edid_info.maxy = 1200;
+    /* FIX: Use VBE macro definitions instead of hardcoded values for max resolution */
+    s->edid_info.maxx = VBE_DISPI_MAX_XRES;
+    s->edid_info.maxy = VBE_DISPI_MAX_YRES;
     
     /* Generate initial EDID blob */
     qemu_edid_generate(s->edid_blob, sizeof(s->edid_blob), &s->edid_info);
