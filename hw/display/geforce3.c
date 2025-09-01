@@ -52,6 +52,39 @@ OBJECT_DECLARE_SIMPLE_TYPE(NVGFState, GEFORCE3)
 #define NV_IMPL_GEFORCE3_TI200  0x01
 #define NV_IMPL_GEFORCE3_TI500  0x02
 
+/* VBE I/O Ports */
+#define VBE_DISPI_IOPORT_INDEX          0x01CE
+#define VBE_DISPI_IOPORT_DATA           0x01CF
+
+/* VBE Registers */
+#define VBE_DISPI_INDEX_ID              0x0
+#define VBE_DISPI_INDEX_XRES            0x1
+#define VBE_DISPI_INDEX_YRES            0x2
+#define VBE_DISPI_INDEX_BPP             0x3
+#define VBE_DISPI_INDEX_ENABLE          0x4
+#define VBE_DISPI_INDEX_BANK            0x5
+#define VBE_DISPI_INDEX_VIRT_WIDTH      0x6
+#define VBE_DISPI_INDEX_VIRT_HEIGHT     0x7
+#define VBE_DISPI_INDEX_X_OFFSET        0x8
+#define VBE_DISPI_INDEX_Y_OFFSET        0x9
+#define VBE_DISPI_INDEX_NB              0xa
+
+/* VBE IDs */
+#define VBE_DISPI_ID0                   0xB0C0
+#define VBE_DISPI_ID1                   0xB0C1
+#define VBE_DISPI_ID2                   0xB0C2
+#define VBE_DISPI_ID3                   0xB0C3
+#define VBE_DISPI_ID4                   0xB0C4
+#define VBE_DISPI_ID5                   0xB0C5
+
+/* VBE Enable bits */
+#define VBE_DISPI_DISABLED              0x00
+#define VBE_DISPI_ENABLED               0x01
+#define VBE_DISPI_GETCAPS               0x02
+#define VBE_DISPI_8BIT_DAC              0x20
+#define VBE_DISPI_LFB_ENABLED           0x40
+#define VBE_DISPI_NOCLEARMEM            0x80
+
 typedef struct NVGFState {
     PCIDevice parent_obj;
     
@@ -62,6 +95,7 @@ typedef struct NVGFState {
     MemoryRegion mmio;
     MemoryRegion lfb;
     MemoryRegion crtc;
+    MemoryRegion vbe_region;
     
     /* DDC/I2C support */
     I2CBus *i2c_bus;
@@ -79,6 +113,8 @@ typedef struct NVGFState {
     /* VBE support */
     uint16_t vbe_index;
     uint16_t vbe_regs[16]; /* VBE register array */
+    bool vbe_enabled;      /* VBE mode enabled flag */
+    bool vbe_fallback_active; /* Whether VBE fallback to standard VGA is active */
     
     /* NVIDIA-specific registers */
     uint32_t pmc_boot_0;
@@ -91,6 +127,7 @@ typedef struct NVGFState {
 
 /* Forward declarations */
 static void geforce_ddc_init(NVGFState *s);
+static void geforce_vbe_init(NVGFState *s);
 static uint64_t geforce_ddc_read(void *opaque, hwaddr addr, unsigned size);
 static void geforce_ddc_write(void *opaque, hwaddr addr, uint64_t val, unsigned size);
 static void geforce_ui_info(void *opaque, uint32_t idx, QemuUIInfo *info);
@@ -111,9 +148,86 @@ static void geforce_vga_ioport_write(void *opaque, hwaddr addr, uint64_t val, un
     vga_ioport_write(&s->vga, addr, val);
 }
 
+/* VBE fallback functions */
+static uint64_t geforce_vbe_read_fallback(void *opaque, hwaddr addr, unsigned size)
+{
+    NVGFState *s = opaque;
+    
+    /* Handle VBE I/O port reads */
+    if (addr == VBE_DISPI_IOPORT_INDEX) {
+        return s->vbe_index;
+    } else if (addr == VBE_DISPI_IOPORT_DATA) {
+        /* Try GeForce-specific VBE first */
+        if (s->vbe_index < ARRAY_SIZE(s->vbe_regs)) {
+            /* Handle GeForce-specific VBE registers */
+            switch (s->vbe_index) {
+            case VBE_DISPI_INDEX_ID:
+                return VBE_DISPI_ID5; /* Report latest VBE version */
+            case VBE_DISPI_INDEX_ENABLE:
+                return s->vbe_enabled ? VBE_DISPI_ENABLED : VBE_DISPI_DISABLED;
+            default:
+                if (s->vbe_index < ARRAY_SIZE(s->vbe_regs)) {
+                    return s->vbe_regs[s->vbe_index];
+                }
+                break;
+            }
+        }
+        
+        /* Fall back to standard VGA VBE if GeForce VBE doesn't handle it */
+        s->vbe_fallback_active = true;
+        return vga_ioport_read(&s->vga, addr);
+    }
+    
+    /* For non-VBE ports, use standard VGA handling */
+    return vga_ioport_read(&s->vga, addr);
+}
+
+static void geforce_vbe_write_fallback(void *opaque, hwaddr addr, uint64_t val, unsigned size)
+{
+    NVGFState *s = opaque;
+    
+    /* Handle VBE I/O port writes */
+    if (addr == VBE_DISPI_IOPORT_INDEX) {
+        s->vbe_index = val;
+        s->vbe_fallback_active = false; /* Reset fallback state on index change */
+        return;
+    } else if (addr == VBE_DISPI_IOPORT_DATA) {
+        /* Try GeForce-specific VBE first */
+        if (s->vbe_index < ARRAY_SIZE(s->vbe_regs)) {
+            /* Handle GeForce-specific VBE registers */
+            switch (s->vbe_index) {
+            case VBE_DISPI_INDEX_ENABLE:
+                s->vbe_enabled = (val & VBE_DISPI_ENABLED) != 0;
+                s->vbe_regs[s->vbe_index] = val;
+                return;
+            case VBE_DISPI_INDEX_XRES:
+            case VBE_DISPI_INDEX_YRES:
+            case VBE_DISPI_INDEX_BPP:
+            case VBE_DISPI_INDEX_BANK:
+            case VBE_DISPI_INDEX_VIRT_WIDTH:
+            case VBE_DISPI_INDEX_VIRT_HEIGHT:
+            case VBE_DISPI_INDEX_X_OFFSET:
+            case VBE_DISPI_INDEX_Y_OFFSET:
+                s->vbe_regs[s->vbe_index] = val;
+                return;
+            default:
+                break;
+            }
+        }
+        
+        /* Fall back to standard VGA VBE if GeForce VBE doesn't handle it */
+        s->vbe_fallback_active = true;
+        vga_ioport_write(&s->vga, addr, val);
+        return;
+    }
+    
+    /* For non-VBE ports, use standard VGA handling */
+    vga_ioport_write(&s->vga, addr, val);
+}
+
 static const MemoryRegionOps geforce_vga_ops = {
-    .read = geforce_vga_ioport_read,
-    .write = geforce_vga_ioport_write,
+    .read = geforce_vbe_read_fallback,
+    .write = geforce_vbe_write_fallback,
     .valid = {
         .min_access_size = 1,
         .max_access_size = 4,
@@ -350,6 +464,30 @@ static void geforce_ddc_write(void *opaque, hwaddr addr, uint64_t val, unsigned 
     }
 }
 
+/* VBE initialization */
+static void geforce_vbe_init(NVGFState *s)
+{
+    /* Initialize VBE state */
+    s->vbe_index = 0;
+    s->vbe_enabled = false;
+    s->vbe_fallback_active = false;
+    
+    /* Initialize VBE registers with default values */
+    memset(s->vbe_regs, 0, sizeof(s->vbe_regs));
+    
+    /* Set up default VBE capabilities */
+    s->vbe_regs[VBE_DISPI_INDEX_ID] = VBE_DISPI_ID5;
+    s->vbe_regs[VBE_DISPI_INDEX_XRES] = 1024;
+    s->vbe_regs[VBE_DISPI_INDEX_YRES] = 768;
+    s->vbe_regs[VBE_DISPI_INDEX_BPP] = 32;
+    s->vbe_regs[VBE_DISPI_INDEX_ENABLE] = VBE_DISPI_DISABLED;
+    s->vbe_regs[VBE_DISPI_INDEX_BANK] = 0;
+    s->vbe_regs[VBE_DISPI_INDEX_VIRT_WIDTH] = 1024;
+    s->vbe_regs[VBE_DISPI_INDEX_VIRT_HEIGHT] = 768;
+    s->vbe_regs[VBE_DISPI_INDEX_X_OFFSET] = 0;
+    s->vbe_regs[VBE_DISPI_INDEX_Y_OFFSET] = 0;
+}
+
 /* UI info callback for dynamic EDID */
 static void geforce_ui_info(void *opaque, uint32_t idx, QemuUIInfo *info)
 {
@@ -409,6 +547,15 @@ static void nv_realize(PCIDevice *pci_dev, Error **errp)
     /* Initialize DDC and EDID */
     geforce_ddc_init(s);
     
+    /* Initialize VBE after VGA init */
+    geforce_vbe_init(s);
+    
+    /* Register VBE I/O ports for direct access */
+    memory_region_init_io(&s->vbe_region, OBJECT(s), &geforce_vga_ops, s,
+                          "geforce3-vbe", 2);
+    memory_region_add_subregion(pci_address_space_io(pci_dev), 
+                                VBE_DISPI_IOPORT_INDEX, &s->vbe_region);
+    
     /* FIX: Register UI info callback for dynamic EDID - Remove & from hw_ops to fix incompatible pointer types */
     vga->con = graphic_console_init(DEVICE(pci_dev), 0, vga->hw_ops, vga);
     qemu_console_set_display_gl_ctx(vga->con, NULL);
@@ -418,6 +565,28 @@ static void nv_realize(PCIDevice *pci_dev, Error **errp)
         dpy_set_ui_info(vga->con, geforce_ui_info, s);
     }
 }
+
+/* VMState for GeForce3 with VBE support */
+static const VMStateDescription vmstate_geforce3 = {
+    .name = "geforce3",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (VMStateField[]) {
+        VMSTATE_PCI_DEVICE(parent_obj, NVGFState),
+        VMSTATE_STRUCT(vga, NVGFState, 0, vmstate_vga_common, VGACommonState),
+        VMSTATE_UINT32_ARRAY(prmvio, NVGFState, NV_PRMVIO_SIZE / 4),
+        VMSTATE_UINT32(pmc_boot_0, NVGFState),
+        VMSTATE_UINT32(pmc_intr_0, NVGFState),
+        VMSTATE_UINT32(pmc_intr_en_0, NVGFState),
+        VMSTATE_UINT32(architecture, NVGFState),
+        VMSTATE_UINT32(implementation, NVGFState),
+        VMSTATE_UINT16(vbe_index, NVGFState),
+        VMSTATE_UINT16_ARRAY(vbe_regs, NVGFState, 16),
+        VMSTATE_BOOL(vbe_enabled, NVGFState),
+        VMSTATE_BOOL(vbe_fallback_active, NVGFState),
+        VMSTATE_END_OF_LIST()
+    }
+};
 
 /* FIX: Update function signature to match expected prototype for class_init */
 static void nv_class_init(ObjectClass *klass, const void *data)
@@ -435,7 +604,7 @@ static void nv_class_init(ObjectClass *klass, const void *data)
     dc->desc = "NVIDIA GeForce3 Graphics Card";
     /* FIX: Modern QEMU uses device_class_set_parent_reset instead of dc->reset */
     /* dc->reset = vga_common_reset; */ /* Removed to fix "no member named 'reset'" error */
-    dc->vmsd = &vmstate_vga_common;
+    dc->vmsd = &vmstate_geforce3;
     dc->hotpluggable = false;
     
     set_bit(DEVICE_CATEGORY_DISPLAY, dc->categories);
