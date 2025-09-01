@@ -134,28 +134,47 @@ static uint64_t geforce_vbe_read(void *opaque, hwaddr addr, unsigned size)
 {
     NVGFState *s = opaque;
     VGACommonState *vga = &s->vga;
+    uint64_t ret = 0xFFFF;
     
     switch (addr) {
     case 0: /* VBE_DISPI_IOPORT_INDEX */
-        return s->vbe_index;
+        ret = s->vbe_index;
+        break;
     case 1: /* VBE_DISPI_IOPORT_DATA */
         if (s->vbe_index < VBE_DISPI_INDEX_NB) {
             /* Coordinate with standard VGA VBE registers */
             if (s->vbe_index < ARRAY_SIZE(vga->vbe_regs)) {
-                return vga->vbe_regs[s->vbe_index];
+                ret = vga->vbe_regs[s->vbe_index];
             }
-            return s->vbe_regs[s->vbe_index];
+            /* Bounds check for GeForce VBE registers */
+            else if (s->vbe_index < ARRAY_SIZE(s->vbe_regs)) {
+                ret = s->vbe_regs[s->vbe_index];
+            }
         }
-        return 0xFFFF;
+        break;
     default:
-        return 0xFFFF;
+        break;
     }
+    
+    /* Log VBE access for debugging (but avoid spam) */
+    if (addr == 0 || (addr == 1 && s->vbe_index <= 3)) {
+        qemu_log_mask(LOG_UNIMP, "GeForce3 VBE: read addr=0x%lx index=%d val=0x%lx\n", 
+                      addr, s->vbe_index, ret);
+    }
+    
+    return ret;
 }
 
 static void geforce_vbe_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
 {
     NVGFState *s = opaque;
     VGACommonState *vga = &s->vga;
+    
+    /* Log VBE access for debugging (but avoid spam) */
+    if (addr == 0 || (addr == 1 && s->vbe_index <= 3)) {
+        qemu_log_mask(LOG_UNIMP, "GeForce3 VBE: write addr=0x%lx index=%d val=0x%lx\n", 
+                      addr, s->vbe_index, val);
+    }
     
     switch (addr) {
     case 0: /* VBE_DISPI_IOPORT_INDEX */
@@ -167,7 +186,10 @@ static void geforce_vbe_write(void *opaque, hwaddr addr, uint64_t val, unsigned 
             if (s->vbe_index < ARRAY_SIZE(vga->vbe_regs)) {
                 vga->vbe_regs[s->vbe_index] = val;
             }
-            s->vbe_regs[s->vbe_index] = val;
+            /* Bounds check for GeForce VBE registers */
+            if (s->vbe_index < ARRAY_SIZE(s->vbe_regs)) {
+                s->vbe_regs[s->vbe_index] = val;
+            }
         }
         break;
     default:
