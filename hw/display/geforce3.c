@@ -581,7 +581,7 @@ static const MemoryRegionOps geforce_crtc_ops = {
     .endianness = DEVICE_LITTLE_ENDIAN,
 };
 
-/* DDC/I2C implementation */
+/* DDC/I2C implementation with comprehensive logging */
 static void geforce_ddc_init(NVGFState *s)
 {
     /* Initialize I2C bus for DDC */
@@ -589,6 +589,8 @@ static void geforce_ddc_init(NVGFState *s)
     /* TODO: Enable when I2C DDC support is available */
     /* s->i2c_ddc = i2c_slave_create_simple(s->i2c_bus, TYPE_I2CDDC, 0x50); */
     s->i2c_ddc = NULL;
+    
+    qemu_log_mask(LOG_GUEST_ERROR, "GeForce3: DDC/I2C bus initialized\n");
     
     /* FIX: Initialize EDID with default values - Fixed vendor assignment to avoid const char* to void* issue */
     uint8_t vendor_id[4] = {' ', 'N', 'V', 'D'};
@@ -604,6 +606,9 @@ static void geforce_ddc_init(NVGFState *s)
     qemu_edid_generate(s->edid_blob, sizeof(s->edid_blob), &s->edid_info);
     s->edid_enabled = true;
     
+    qemu_log_mask(LOG_GUEST_ERROR, "GeForce3: EDID initialized %dx%d default resolution\n", 
+                  s->edid_info.prefx, s->edid_info.prefy);
+    
     /* Set EDID data in DDC device */
     if (s->i2c_ddc) {
         /* I2CDDCState *ddc = I2CDDC(s->i2c_ddc); */
@@ -615,69 +620,102 @@ static void geforce_ddc_init(NVGFState *s)
 static uint64_t geforce_ddc_read(void *opaque, hwaddr addr, unsigned size)
 {
     NVGFState *s = opaque;
+    uint64_t ret = 0xff;
+    
+    qemu_log_mask(LOG_GUEST_ERROR, "GeForce3: DDC read addr=0x%04lx size=%d ", addr, size);
     
     if (!s->edid_enabled || !s->i2c_bus) {
-        return 0xff;
+        qemu_log_mask(LOG_GUEST_ERROR, "DDC_disabled value=0x%08lx\n", ret);
+        return ret;
     }
     
     switch (addr) {
     case 0x00: /* DDC data */
-        return i2c_recv(s->i2c_bus);
+        ret = i2c_recv(s->i2c_bus);
+        qemu_log_mask(LOG_GUEST_ERROR, "DDC_data value=0x%08lx\n", ret);
+        break;
     case 0x04: /* DDC control/status */
-        return s->ddc_state;
+        ret = s->ddc_state;
+        qemu_log_mask(LOG_GUEST_ERROR, "DDC_control value=0x%08lx\n", ret);
+        break;
     default:
-        return 0xff;
+        qemu_log_mask(LOG_GUEST_ERROR, "DDC_unknown value=0x%08lx - guest may be confused\n", ret);
+        break;
     }
+    
+    return ret;
 }
 
 static void geforce_ddc_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
 {
     NVGFState *s = opaque;
     
+    qemu_log_mask(LOG_GUEST_ERROR, "GeForce3: DDC write addr=0x%04lx value=0x%08lx size=%d ", 
+                  addr, val, size);
+    
     if (!s->edid_enabled || !s->i2c_bus) {
+        qemu_log_mask(LOG_GUEST_ERROR, "DDC_disabled\n");
         return;
     }
     
     switch (addr) {
     case 0x00: /* DDC data */
         i2c_send(s->i2c_bus, val);
+        qemu_log_mask(LOG_GUEST_ERROR, "DDC_data_sent\n");
         break;
     case 0x04: /* DDC control */
         s->ddc_state = val;
         if (val & DDC_SCL_PIN) {
             i2c_start_transfer(s->i2c_bus, (val & DDC_SDA_PIN) ? 0x51 : 0x50, 0);
+            qemu_log_mask(LOG_GUEST_ERROR, "DDC_transfer_start addr=0x%02x\n", 
+                          (val & DDC_SDA_PIN) ? 0x51 : 0x50);
+        } else {
+            qemu_log_mask(LOG_GUEST_ERROR, "DDC_control_set\n");
         }
         break;
     default:
+        qemu_log_mask(LOG_GUEST_ERROR, "DDC_unknown - guest may be confused\n");
         break;
     }
 }
 
-/* UI info callback for dynamic EDID */
+/* UI info callback for dynamic EDID with comprehensive logging */
 static void geforce_ui_info(void *opaque, uint32_t idx, QemuUIInfo *info)
 {
     NVGFState *s = opaque;
     
+    qemu_log_mask(LOG_GUEST_ERROR, "GeForce3: UI info callback idx=%d ", idx);
+    
     if (!s->edid_enabled) {
+        qemu_log_mask(LOG_GUEST_ERROR, "EDID_disabled\n");
         return;
     }
     
     /* Update EDID info with new display information */
     if (info->width && info->height) {
+        qemu_log_mask(LOG_GUEST_ERROR, "resolution=%dx%d ", info->width, info->height);
+        
         s->edid_info.prefx = info->width;
         s->edid_info.prefy = info->height;
         s->edid_info.maxx = MAX(info->width, s->edid_info.maxx);
         s->edid_info.maxy = MAX(info->height, s->edid_info.maxy);
         
+        qemu_log_mask(LOG_GUEST_ERROR, "max_res=%dx%d ", s->edid_info.maxx, s->edid_info.maxy);
+        
         /* Regenerate EDID blob */
         qemu_edid_generate(s->edid_blob, sizeof(s->edid_blob), &s->edid_info);
+        
+        qemu_log_mask(LOG_GUEST_ERROR, "EDID_regenerated\n");
         
         /* Update DDC device with new EDID */
         if (s->i2c_ddc) {
             /* I2CDDCState *ddc = I2CDDC(s->i2c_ddc); */
             /* TODO: Enable when i2c_ddc_set_edid is available */
             /* i2c_ddc_set_edid(ddc, s->edid_blob, sizeof(s->edid_blob)); */
+            qemu_log_mask(LOG_GUEST_ERROR, "GeForce3: DDC device would be updated with new EDID\n");
         }
+    } else {
+        qemu_log_mask(LOG_GUEST_ERROR, "invalid_resolution\n");
     }
 }
 
@@ -840,6 +878,23 @@ static void nv_get_vram_size(Object *obj, Visitor *v, const char *name,
     NVGFState *s = GEFORCE3(obj);
     visit_type_uint32(v, name, &s->vram_size_mb, errp);
 }
+
+/* ROM file property support for -device geforce,romfile= */
+static void nv_set_romfile(Object *obj, const char *value, Error **errp)
+{
+    NVGFState *s = GEFORCE3(obj);
+    
+    g_free(s->romfile);
+    s->romfile = g_strdup(value);
+    
+    qemu_log_mask(LOG_GUEST_ERROR, "GeForce3: ROM file set to %s\n", value ? value : "none");
+}
+
+static char *nv_get_romfile(Object *obj, Error **errp)
+{
+    NVGFState *s = GEFORCE3(obj);
+    return g_strdup(s->romfile);
+}
 /* FIX: Update function signature to match expected prototype for class_init */
 static void nv_class_init(ObjectClass *klass, const void *data)
 {
@@ -870,7 +925,7 @@ static void nv_class_init(ObjectClass *klass, const void *data)
     object_class_property_set_description(klass, "vramsize", 
         "VRAM size in MB (64-512MB supported)");
     
-    object_class_property_add_str(klass, "romfile", NULL, NULL);
+    object_class_property_add_str(klass, "romfile", nv_get_romfile, nv_set_romfile);
     object_class_property_set_description(klass, "romfile", 
         "Optional ROM file path");
     
