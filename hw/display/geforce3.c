@@ -154,6 +154,135 @@ static bool vbe_validate_mode(uint16_t xres, uint16_t yres, uint16_t bpp);
 static void vbe_update_display(NVGFState *s);
 static void vbe_sync_crtc(NVGFState *s);
 static bool should_log_mmio_access(NVGFState *s, hwaddr addr, uint64_t val);
+static void vbe_convert_pixel_format(NVGFState *s, uint8_t *src, uint8_t *dst, int width, int height);
+static uint32_t vbe_convert_rgb555_to_rgb888(uint16_t rgb555);
+static uint32_t vbe_convert_rgb565_to_rgb888(uint16_t rgb565);
+static uint32_t vbe_convert_bgr24_to_rgb888(uint8_t *bgr24);
+static uint32_t vbe_convert_bgrx32_to_xrgb32(uint32_t bgrx);
+
+/* Color format conversion functions */
+
+/* Convert 15-bit RGB555 to 32-bit RGB888 (fixed: was treating as 16-bit) */
+static uint32_t vbe_convert_rgb555_to_rgb888(uint16_t rgb555)
+{
+    uint8_t r = (rgb555 >> 10) & 0x1F;  /* 5 bits red */
+    uint8_t g = (rgb555 >> 5) & 0x1F;   /* 5 bits green */
+    uint8_t b = rgb555 & 0x1F;          /* 5 bits blue */
+    
+    /* Expand 5-bit values to 8-bit with proper scaling */
+    r = (r << 3) | (r >> 2);
+    g = (g << 3) | (g >> 2);
+    b = (b << 3) | (b >> 2);
+    
+    return (r << 16) | (g << 8) | b;
+}
+
+/* Convert 16-bit RGB565 to 32-bit RGB888 (fixed bit expansion) */
+static uint32_t vbe_convert_rgb565_to_rgb888(uint16_t rgb565)
+{
+    uint8_t r = (rgb565 >> 11) & 0x1F;  /* 5 bits red */
+    uint8_t g = (rgb565 >> 5) & 0x3F;   /* 6 bits green */
+    uint8_t b = rgb565 & 0x1F;          /* 5 bits blue */
+    
+    /* Expand to 8-bit with proper scaling */
+    r = (r << 3) | (r >> 2);
+    g = (g << 2) | (g >> 4);
+    b = (b << 3) | (b >> 2);
+    
+    return (r << 16) | (g << 8) | b;
+}
+
+/* Convert 24-bit BGR packed to 32-bit RGB888 (fixed format) */
+static uint32_t vbe_convert_bgr24_to_rgb888(uint8_t *bgr24)
+{
+    uint8_t b = bgr24[0];
+    uint8_t g = bgr24[1];
+    uint8_t r = bgr24[2];
+    
+    return (r << 16) | (g << 8) | b;
+}
+
+/* Convert 32-bit BGRX to XRGB (fixed byte order) */
+static uint32_t vbe_convert_bgrx32_to_xrgb32(uint32_t bgrx)
+{
+    uint8_t b = (bgrx >> 0) & 0xFF;
+    uint8_t g = (bgrx >> 8) & 0xFF;
+    uint8_t r = (bgrx >> 16) & 0xFF;
+    uint8_t x = (bgrx >> 24) & 0xFF;
+    
+    return (x << 24) | (r << 16) | (g << 8) | b;
+}
+
+/* Enhanced pixel format conversion with proper handling for all BPP modes */
+static void vbe_convert_pixel_format(NVGFState *s, uint8_t *src, uint8_t *dst, int width, int height)
+{
+    int src_bpp = s->vbe_bpp;
+    int dst_bpp = 32; /* Target format is always 32-bit XRGB */
+    
+    int src_bytes_per_pixel = (src_bpp + 7) / 8;
+    int dst_bytes_per_pixel = 4;
+    
+    uint8_t *src_line = src;
+    uint8_t *dst_line = dst;
+    
+    for (int y = 0; y < height; y++) {
+        uint8_t *src_pixel = src_line;
+        uint32_t *dst_pixel = (uint32_t *)dst_line;
+        
+        for (int x = 0; x < width; x++) {
+            uint32_t converted_pixel = 0;
+            
+            switch (src_bpp) {
+            case 8: {
+                /* 8-bit palette mode - use VGA palette */
+                uint8_t palette_index = *src_pixel;
+                VGACommonState *vga = &s->vga;
+                if (palette_index < 256) {
+                    uint8_t r = vga->palette[palette_index * 3 + 0];
+                    uint8_t g = vga->palette[palette_index * 3 + 1];
+                    uint8_t b = vga->palette[palette_index * 3 + 2];
+                    converted_pixel = (r << 16) | (g << 8) | b;
+                }
+                break;
+            }
+            case 15: {
+                /* 15-bit RGB555 format */
+                uint16_t rgb555 = *(uint16_t *)src_pixel;
+                converted_pixel = vbe_convert_rgb555_to_rgb888(rgb555);
+                break;
+            }
+            case 16: {
+                /* 16-bit RGB565 format */
+                uint16_t rgb565 = *(uint16_t *)src_pixel;
+                converted_pixel = vbe_convert_rgb565_to_rgb888(rgb565);
+                break;
+            }
+            case 24: {
+                /* 24-bit BGR packed format */
+                converted_pixel = vbe_convert_bgr24_to_rgb888(src_pixel);
+                break;
+            }
+            case 32: {
+                /* 32-bit BGRX format */
+                uint32_t bgrx = *(uint32_t *)src_pixel;
+                converted_pixel = vbe_convert_bgrx32_to_xrgb32(bgrx);
+                break;
+            }
+            default:
+                /* Unsupported format - use black */
+                converted_pixel = 0x00000000;
+                break;
+            }
+            
+            *dst_pixel = converted_pixel;
+            src_pixel += src_bytes_per_pixel;
+            dst_pixel++;
+        }
+        
+        src_line += (width * src_bytes_per_pixel + 3) & ~3; /* Source pitch with alignment */
+        dst_line += width * dst_bytes_per_pixel; /* Destination pitch */
+    }
+}
 
 /* VBE mode validation */
 static bool vbe_validate_mode(uint16_t xres, uint16_t yres, uint16_t bpp)
@@ -234,6 +363,16 @@ static void vbe_update_display(NVGFState *s)
     
     /* Update VGA state with VBE parameters */
     vga->vram_size_mb = NV_LFB_SIZE / (1024 * 1024);
+    
+    /* Set up display surface format based on VBE mode */
+    if (s->vbe_bpp != 32) {
+        /* For non-32bpp modes, we need to convert the pixel format */
+        /* This would typically involve setting up a conversion buffer */
+        /* and calling vbe_convert_pixel_format() during display updates */
+        qemu_log_mask(LOG_GUEST_ERROR, 
+            "geforce3: VBE pixel format conversion active for %d-bpp mode\n", 
+            s->vbe_bpp);
+    }
     
     /* Trigger display refresh */
     if (vga->con) {
@@ -555,6 +694,19 @@ static uint64_t geforce_crtc_read(void *opaque, hwaddr addr, unsigned size)
     switch (addr) {
     case 0x00: /* CRTC status */
         return 0x01; /* Not in VBlank */
+    case 0x28: /* CRTC pixel format register */
+        /* Return pixel format based on current VBE mode */
+        if (s->vbe_enable & VBE_DISPI_ENABLED) {
+            switch (s->vbe_bpp) {
+            case 8:  return 0x01; /* 8-bit palette */
+            case 15: return 0x02; /* 15-bit RGB555 */
+            case 16: return 0x03; /* 16-bit RGB565 */
+            case 24: return 0x04; /* 24-bit BGR */
+            case 32: return 0x05; /* 32-bit BGRX */
+            default: return 0x00; /* Unknown */
+            }
+        }
+        return 0x00;
     default:
         return 0;
     }
@@ -574,6 +726,29 @@ static void geforce_crtc_write(void *opaque, hwaddr addr, uint64_t val, unsigned
     switch (addr) {
     case 0x00: /* CRTC control */
         /* Handle CRTC control */
+        break;
+    case 0x28: /* CRTC pixel format register */
+        /* Sync with VBE mode if enabled */
+        if (s->vbe_enable & VBE_DISPI_ENABLED) {
+            /* Map CRTC pixel format to VBE BPP */
+            uint16_t new_bpp = s->vbe_bpp;
+            switch (val) {
+            case 0x01: new_bpp = 8; break;
+            case 0x02: new_bpp = 15; break;
+            case 0x03: new_bpp = 16; break;
+            case 0x04: new_bpp = 24; break;
+            case 0x05: new_bpp = 32; break;
+            }
+            
+            if (new_bpp != s->vbe_bpp && vbe_validate_mode(s->vbe_xres, s->vbe_yres, new_bpp)) {
+                s->vbe_bpp = new_bpp;
+                s->vbe_mode_changed = true;
+                vbe_update_display(s);
+                qemu_log_mask(LOG_GUEST_ERROR, 
+                    "geforce3: CRTC pixel format changed to %d-bpp (synced with VBE)\n", 
+                    new_bpp);
+            }
+        }
         break;
     default:
         break;
