@@ -168,17 +168,40 @@ static void vbe_enable_mode(NVGFState *s);
 static void vbe_disable_mode(NVGFState *s);
 static void vbe_update_bank(NVGFState *s);
 static void vbe_fallback_to_vga(NVGFState *s);
+static void vbe_update_display(NVGFState *s, uint32_t addr, uint32_t size);
+static bool vbe_validate_virtual_resolution(NVGFState *s);
+static void vbe_update_display_start(NVGFState *s);
 
-/* VGA I/O operations */
+/* VGA I/O operations with VBE DISPI port support */
 static uint64_t geforce_vga_ioport_read(void *opaque, hwaddr addr, unsigned size)
 {
     NVGFState *s = opaque;
+    
+    /* Handle VBE DISPI ports */
+    if (addr == VBE_DISPI_IOPORT_INDEX) {
+        return s->vbe.vbe_index;
+    } else if (addr == VBE_DISPI_IOPORT_DATA) {
+        return vbe_read_reg(s, s->vbe.vbe_index);
+    }
+    
+    /* Fallback to standard VGA I/O */
     return vga_ioport_read(&s->vga, addr);
 }
 
 static void geforce_vga_ioport_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
 {
     NVGFState *s = opaque;
+    
+    /* Handle VBE DISPI ports */
+    if (addr == VBE_DISPI_IOPORT_INDEX) {
+        s->vbe.vbe_index = val & 0xFFFF;
+        return;
+    } else if (addr == VBE_DISPI_IOPORT_DATA) {
+        vbe_write_reg(s, s->vbe.vbe_index, val & 0xFFFF);
+        return;
+    }
+    
+    /* Fallback to standard VGA I/O */
     vga_ioport_write(&s->vga, addr, val);
 }
 
@@ -337,6 +360,17 @@ static void vbe_write_reg(NVGFState *s, uint16_t index, uint16_t val)
         /* Validate virtual dimensions */
         if (val <= VBE_DISPI_MAX_XRES) {
             vbe->vbe_regs[index] = val;
+            /* Recalculate line offset if virtual width changed */
+            if (index == VBE_DISPI_INDEX_VIRT_WIDTH && vbe->vbe_enabled) {
+                uint16_t bpp = vbe->vbe_regs[VBE_DISPI_INDEX_BPP];
+                vbe->vbe_line_offset = val * ((bpp + 7) / 8);
+            }
+            /* Validate virtual resolution if VBE is enabled */
+            if (vbe->vbe_enabled && !vbe_validate_virtual_resolution(s)) {
+                qemu_log_mask(LOG_GUEST_ERROR, 
+                             "geforce3: Invalid virtual resolution, falling back to VGA\n");
+                vbe_fallback_to_vga(s);
+            }
         }
         break;
         
@@ -344,6 +378,16 @@ static void vbe_write_reg(NVGFState *s, uint16_t index, uint16_t val)
     case VBE_DISPI_INDEX_Y_OFFSET:
         /* Validate offsets don't exceed virtual dimensions */
         vbe->vbe_regs[index] = val;
+        if (vbe->vbe_enabled) {
+            if (!vbe_validate_virtual_resolution(s)) {
+                /* Reset invalid offsets */
+                vbe->vbe_regs[VBE_DISPI_INDEX_X_OFFSET] = 0;
+                vbe->vbe_regs[VBE_DISPI_INDEX_Y_OFFSET] = 0;
+            } else {
+                /* Update display start address for panning */
+                vbe_update_display_start(s);
+            }
+        }
         break;
         
     default:
@@ -377,8 +421,19 @@ static void vbe_enable_mode(NVGFState *s)
         vbe->vbe_regs[VBE_DISPI_INDEX_VIRT_HEIGHT] = yres;
     }
     
+    /* Validate virtual resolution and offsets */
+    if (!vbe_validate_virtual_resolution(s)) {
+        qemu_log_mask(LOG_GUEST_ERROR, 
+                     "geforce3: Virtual resolution validation failed, falling back to VGA\n");
+        vbe_fallback_to_vga(s);
+        return;
+    }
+    
     /* Calculate line offset */
     vbe->vbe_line_offset = vbe->vbe_regs[VBE_DISPI_INDEX_VIRT_WIDTH] * ((bpp + 7) / 8);
+    
+    /* Update display start address for panning */
+    vbe_update_display_start(s);
     
     /* Set up banking if not using linear frame buffer */
     if (!(enable & VBE_DISPI_LFB_ENABLED)) {
@@ -466,6 +521,112 @@ static void vbe_fallback_to_vga(NVGFState *s)
     qemu_log_mask(LOG_TRACE, "geforce3: Fallback to VGA mode\n");
 }
 
+/* Notify display subsystem of VBE memory updates */
+static void vbe_update_display(NVGFState *s, uint32_t addr, uint32_t size)
+{
+    VBEState *vbe = &s->vbe;
+    
+    if (!vbe->vbe_enabled) {
+        return;
+    }
+    
+    /* Calculate affected scanlines for efficient updates */
+    uint16_t xres = vbe->vbe_regs[VBE_DISPI_INDEX_XRES];
+    uint16_t yres = vbe->vbe_regs[VBE_DISPI_INDEX_YRES];
+    uint16_t bpp = vbe->vbe_regs[VBE_DISPI_INDEX_BPP];
+    uint32_t line_offset = vbe->vbe_line_offset;
+    
+    if (line_offset == 0) {
+        return;
+    }
+    
+    /* Calculate start and end lines affected by this memory update */
+    uint32_t start_line = addr / line_offset;
+    uint32_t end_line = (addr + size - 1) / line_offset;
+    
+    /* Clamp to display bounds */
+    if (start_line >= yres) {
+        return;
+    }
+    if (end_line >= yres) {
+        end_line = yres - 1;
+    }
+    
+    /* Mark the affected region as dirty for display refresh */
+    uint32_t dirty_start = start_line * line_offset;
+    uint32_t dirty_size = (end_line - start_line + 1) * line_offset;
+    
+    memory_region_set_dirty(&s->vga.vram, dirty_start, dirty_size);
+    
+    qemu_log_mask(LOG_TRACE, 
+                 "geforce3: VBE display update: lines %u-%u, addr 0x%x, size %u\n",
+                 start_line, end_line, addr, size);
+}
+
+/* Validate virtual resolution and offsets */
+static bool vbe_validate_virtual_resolution(NVGFState *s)
+{
+    VBEState *vbe = &s->vbe;
+    uint16_t phys_xres = vbe->vbe_regs[VBE_DISPI_INDEX_XRES];
+    uint16_t phys_yres = vbe->vbe_regs[VBE_DISPI_INDEX_YRES];
+    uint16_t virt_width = vbe->vbe_regs[VBE_DISPI_INDEX_VIRT_WIDTH];
+    uint16_t virt_height = vbe->vbe_regs[VBE_DISPI_INDEX_VIRT_HEIGHT];
+    uint16_t x_offset = vbe->vbe_regs[VBE_DISPI_INDEX_X_OFFSET];
+    uint16_t y_offset = vbe->vbe_regs[VBE_DISPI_INDEX_Y_OFFSET];
+    uint16_t bpp = vbe->vbe_regs[VBE_DISPI_INDEX_BPP];
+    
+    /* Virtual resolution must be at least as large as physical */
+    if (virt_width < phys_xres || virt_height < phys_yres) {
+        qemu_log_mask(LOG_GUEST_ERROR, 
+                     "geforce3: Virtual resolution %dx%d smaller than physical %dx%d\n",
+                     virt_width, virt_height, phys_xres, phys_yres);
+        return false;
+    }
+    
+    /* Check if offsets are within virtual bounds */
+    if (x_offset + phys_xres > virt_width || y_offset + phys_yres > virt_height) {
+        qemu_log_mask(LOG_GUEST_ERROR, 
+                     "geforce3: Display offset (%d,%d) + physical size (%dx%d) exceeds virtual (%dx%d)\n",
+                     x_offset, y_offset, phys_xres, phys_yres, virt_width, virt_height);
+        return false;
+    }
+    
+    /* Check memory requirements for virtual resolution */
+    uint32_t required_mem = virt_width * virt_height * ((bpp + 7) / 8);
+    if (required_mem > vbe->vbe_size) {
+        qemu_log_mask(LOG_GUEST_ERROR, 
+                     "geforce3: Virtual resolution requires %u bytes, only %u available\n",
+                     required_mem, vbe->vbe_size);
+        return false;
+    }
+    
+    return true;
+}
+
+/* Update display start address for panning/scrolling */
+static void vbe_update_display_start(NVGFState *s)
+{
+    VBEState *vbe = &s->vbe;
+    uint16_t x_offset = vbe->vbe_regs[VBE_DISPI_INDEX_X_OFFSET];
+    uint16_t y_offset = vbe->vbe_regs[VBE_DISPI_INDEX_Y_OFFSET];
+    uint16_t bpp = vbe->vbe_regs[VBE_DISPI_INDEX_BPP];
+    uint32_t bytes_per_pixel = (bpp + 7) / 8;
+    
+    /* Calculate display start address based on offsets */
+    vbe->vbe_start_addr = (y_offset * vbe->vbe_line_offset) + (x_offset * bytes_per_pixel);
+    
+    /* Ensure start address is within VRAM bounds */
+    if (vbe->vbe_start_addr >= vbe->vbe_size) {
+        vbe->vbe_start_addr = 0;
+        vbe->vbe_regs[VBE_DISPI_INDEX_X_OFFSET] = 0;
+        vbe->vbe_regs[VBE_DISPI_INDEX_Y_OFFSET] = 0;
+    }
+    
+    qemu_log_mask(LOG_TRACE, 
+                 "geforce3: VBE display start updated to 0x%x (offset %d,%d)\n",
+                 vbe->vbe_start_addr, x_offset, y_offset);
+}
+
 /* Enhanced memory access functions for VBE banking and LFB */
 
 /* Read from VBE memory with banking support */
@@ -528,6 +689,7 @@ static void vbe_mem_write(void *opaque, hwaddr addr, uint64_t val, unsigned size
 {
     NVGFState *s = opaque;
     VBEState *vbe = &s->vbe;
+    uint32_t physical_addr;
     
     if (!vbe->vbe_enabled) {
         /* Fall back to standard VGA memory access */
@@ -538,6 +700,7 @@ static void vbe_mem_write(void *opaque, hwaddr addr, uint64_t val, unsigned size
     if (vbe->vbe_regs[VBE_DISPI_INDEX_ENABLE] & VBE_DISPI_LFB_ENABLED) {
         /* Linear framebuffer mode - direct VRAM access */
         if (addr < vbe->vbe_size) {
+            physical_addr = addr;
             switch (size) {
             case 1:
                 s->vga.vram_ptr[addr] = val;
@@ -552,14 +715,14 @@ static void vbe_mem_write(void *opaque, hwaddr addr, uint64_t val, unsigned size
                 stq_le_p(s->vga.vram_ptr + addr, val);
                 break;
             }
-            
-            /* Mark display area as dirty for refresh */
-            memory_region_set_dirty(&s->vga.vram, addr, size);
+        } else {
+            return;
         }
     } else {
         /* Banked mode - 64KB window */
         uint32_t bank_addr = (addr % VBE_DISPI_BANK_SIZE) + vbe->bank_offset;
         if (bank_addr < vbe->vbe_size) {
+            physical_addr = bank_addr;
             switch (size) {
             case 1:
                 s->vga.vram_ptr[bank_addr] = val;
@@ -574,11 +737,13 @@ static void vbe_mem_write(void *opaque, hwaddr addr, uint64_t val, unsigned size
                 stq_le_p(s->vga.vram_ptr + bank_addr, val);
                 break;
             }
-            
-            /* Mark display area as dirty for refresh */
-            memory_region_set_dirty(&s->vga.vram, bank_addr, size);
+        } else {
+            return;
         }
     }
+    
+    /* Notify display of the update */
+    vbe_update_display(s, physical_addr, size);
 }
 
 /* Memory operations for VBE LFB region */
