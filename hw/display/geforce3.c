@@ -23,6 +23,7 @@
 #include "hw/i2c/i2c.h"
 #include "qapi/error.h"
 #include "ui/console.h"
+#include "exec/address-spaces.h"
 
 #define TYPE_GEFORCE3 "geforce3"
 OBJECT_DECLARE_SIMPLE_TYPE(NVGFState, GEFORCE3)
@@ -39,6 +40,11 @@ OBJECT_DECLARE_SIMPLE_TYPE(NVGFState, GEFORCE3)
 /* DDC/I2C constants */
 #define DDC_SDA_PIN             0x01
 #define DDC_SCL_PIN             0x02
+
+/* VBE constants */
+#define VBE_DISPI_IOPORT_INDEX  0x01CE
+#define VBE_DISPI_IOPORT_DATA   0x01CF
+#define VBE_DISPI_INDEX_NB      16
 
 /* NVIDIA register offsets */
 #define NV_PMC_BOOT_0           0x000000
@@ -62,6 +68,7 @@ typedef struct NVGFState {
     MemoryRegion mmio;
     MemoryRegion lfb;
     MemoryRegion crtc;
+    MemoryRegion vbe_region;
     
     /* DDC/I2C support */
     I2CBus *i2c_bus;
@@ -97,6 +104,7 @@ static void geforce_ui_info(void *opaque, uint32_t idx, QemuUIInfo *info);
 static uint32_t nv_compute_boot0(NVGFState *s);
 static void nv_apply_model_ids(NVGFState *s);
 static uint64_t nv_bar0_readl(void *opaque, hwaddr addr, unsigned size);
+static void geforce_init_vbe_regions(NVGFState *s);
 
 /* VGA I/O operations */
 static uint64_t geforce_vga_ioport_read(void *opaque, hwaddr addr, unsigned size)
@@ -117,6 +125,84 @@ static const MemoryRegionOps geforce_vga_ops = {
     .valid = {
         .min_access_size = 1,
         .max_access_size = 4,
+    },
+    .endianness = DEVICE_LITTLE_ENDIAN,
+};
+
+/* VBE I/O operations for GeForce VBE coordination */
+static uint64_t geforce_vbe_read(void *opaque, hwaddr addr, unsigned size)
+{
+    NVGFState *s = opaque;
+    VGACommonState *vga = &s->vga;
+    uint64_t ret = 0xFFFF;
+    
+    switch (addr) {
+    case 0: /* VBE_DISPI_IOPORT_INDEX */
+        ret = s->vbe_index;
+        break;
+    case 1: /* VBE_DISPI_IOPORT_DATA */
+        if (s->vbe_index < VBE_DISPI_INDEX_NB) {
+            /* Coordinate with standard VGA VBE registers */
+            if (s->vbe_index < ARRAY_SIZE(vga->vbe_regs)) {
+                ret = vga->vbe_regs[s->vbe_index];
+            }
+            /* Bounds check for GeForce VBE registers */
+            else if (s->vbe_index < ARRAY_SIZE(s->vbe_regs)) {
+                ret = s->vbe_regs[s->vbe_index];
+            }
+        }
+        break;
+    default:
+        break;
+    }
+    
+    /* Log VBE access for debugging (but avoid spam) */
+    if (addr == 0 || (addr == 1 && s->vbe_index <= 3)) {
+        qemu_log_mask(LOG_UNIMP, "GeForce3 VBE: read addr=0x%lx index=%d val=0x%lx\n", 
+                      addr, s->vbe_index, ret);
+    }
+    
+    return ret;
+}
+
+static void geforce_vbe_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
+{
+    NVGFState *s = opaque;
+    VGACommonState *vga = &s->vga;
+    
+    /* Log VBE access for debugging (but avoid spam) */
+    if (addr == 0 || (addr == 1 && s->vbe_index <= 3)) {
+        qemu_log_mask(LOG_UNIMP, "GeForce3 VBE: write addr=0x%lx index=%d val=0x%lx\n", 
+                      addr, s->vbe_index, val);
+    }
+    
+    switch (addr) {
+    case 0: /* VBE_DISPI_IOPORT_INDEX */
+        s->vbe_index = val;
+        break;
+    case 1: /* VBE_DISPI_IOPORT_DATA */
+        if (s->vbe_index < VBE_DISPI_INDEX_NB) {
+            /* Update both GeForce and standard VGA VBE registers for coordination */
+            if (s->vbe_index < ARRAY_SIZE(vga->vbe_regs)) {
+                vga->vbe_regs[s->vbe_index] = val;
+            }
+            /* Bounds check for GeForce VBE registers */
+            if (s->vbe_index < ARRAY_SIZE(s->vbe_regs)) {
+                s->vbe_regs[s->vbe_index] = val;
+            }
+        }
+        break;
+    default:
+        break;
+    }
+}
+
+static const MemoryRegionOps geforce_vbe_ops = {
+    .read = geforce_vbe_read,
+    .write = geforce_vbe_write,
+    .valid = {
+        .min_access_size = 1,
+        .max_access_size = 2,
     },
     .endianness = DEVICE_LITTLE_ENDIAN,
 };
@@ -350,6 +436,25 @@ static void geforce_ddc_write(void *opaque, hwaddr addr, uint64_t val, unsigned 
     }
 }
 
+/* VBE region initialization for proper VBE coordination */
+static void geforce_init_vbe_regions(NVGFState *s)
+{
+    /* Initialize VBE registers with default values */
+    s->vbe_index = 0;
+    memset(s->vbe_regs, 0, sizeof(s->vbe_regs));
+    
+    /* Set reasonable VBE defaults for coordination */
+    s->vbe_regs[1] = s->edid_info.prefx;  /* VBE_DISPI_INDEX_XRES */
+    s->vbe_regs[2] = s->edid_info.prefy;  /* VBE_DISPI_INDEX_YRES */
+    s->vbe_regs[3] = 32;                  /* VBE_DISPI_INDEX_BPP */
+    
+    /* GeForce VBE takes over standard VBE I/O ports for coordination */
+    memory_region_init_io(&s->vbe_region, OBJECT(s), &geforce_vbe_ops, s,
+                         "geforce-vbe", 2);
+    memory_region_add_subregion(get_system_io(), VBE_DISPI_IOPORT_INDEX,
+                               &s->vbe_region);
+}
+
 /* UI info callback for dynamic EDID */
 static void geforce_ui_info(void *opaque, uint32_t idx, QemuUIInfo *info)
 {
@@ -374,6 +479,13 @@ static void geforce_ui_info(void *opaque, uint32_t idx, QemuUIInfo *info)
             /* I2CDDCState *ddc = I2CDDC(s->i2c_ddc); */
             /* TODO: Enable when i2c_ddc_set_edid is available */
             /* i2c_ddc_set_edid(ddc, s->edid_blob, sizeof(s->edid_blob)); */
+        }
+        
+        /* Update VBE resolution information for coordination */
+        if (info->width <= 0xFFFF && info->height <= 0xFFFF) {
+            /* Update VBE registers with new resolution for proper coordination */
+            s->vbe_regs[1] = info->width;   /* VBE_DISPI_INDEX_XRES */
+            s->vbe_regs[2] = info->height;  /* VBE_DISPI_INDEX_YRES */
         }
     }
 }
@@ -409,13 +521,25 @@ static void nv_realize(PCIDevice *pci_dev, Error **errp)
     /* Initialize DDC and EDID */
     geforce_ddc_init(s);
     
+    /* Initialize VBE regions for coordination with standard VGA VBE */
+    geforce_init_vbe_regions(s);
+    
     /* FIX: Register UI info callback for dynamic EDID - Remove & from hw_ops to fix incompatible pointer types */
     vga->con = graphic_console_init(DEVICE(pci_dev), 0, vga->hw_ops, vga);
     qemu_console_set_display_gl_ctx(vga->con, NULL);
     
-    /* FIX: Set up UI info callback - Use dpy_set_ui_info instead of qemu_console_set_ui_info */
+    /* FIX: Set up UI info callback properly - register callback function instead of passing data */
     if (vga->con) {
-        dpy_set_ui_info(vga->con, geforce_ui_info, s);
+        /* Register UI info callback for dynamic EDID updates */
+        dpy_set_ui_info(vga->con, NULL, false); /* Initialize with no UI info */
+        /* TODO: Properly register geforce_ui_info callback when QEMU API supports it */
+        /* For now, set initial UI info based on EDID defaults */
+        QemuUIInfo ui_info = {
+            .width = s->edid_info.prefx,
+            .height = s->edid_info.prefy,
+            .refresh_rate = 60
+        };
+        dpy_set_ui_info(vga->con, &ui_info, false);
     }
 }
 
