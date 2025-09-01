@@ -95,6 +95,7 @@ typedef struct NVGFState {
     MemoryRegion mmio;
     MemoryRegion lfb;
     MemoryRegion crtc;
+    MemoryRegion vbe_region;
     
     /* DDC/I2C support */
     I2CBus *i2c_bus;
@@ -548,6 +549,12 @@ static void nv_realize(PCIDevice *pci_dev, Error **errp)
     
     /* Initialize VBE after VGA init */
     geforce_vbe_init(s);
+    
+    /* Register VBE I/O ports for direct access */
+    memory_region_init_io(&s->vbe_region, OBJECT(s), &geforce_vga_ops, s,
+                          "geforce3-vbe", 2);
+    memory_region_add_subregion(pci_address_space_io(pci_dev), 
+                                VBE_DISPI_IOPORT_INDEX, &s->vbe_region);
     
     /* FIX: Register UI info callback for dynamic EDID - Remove & from hw_ops to fix incompatible pointer types */
     vga->con = graphic_console_init(DEVICE(pci_dev), 0, vga->hw_ops, vga);
