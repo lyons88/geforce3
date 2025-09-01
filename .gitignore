@@ -1,0 +1,25 @@
+# Build artifacts
+*.o
+*.so
+*.a
+*.exe
+test_edid
+
+# Temporary files
+*.tmp
+*~
+.DS_Store
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Dependencies
+node_modules/
+vendor/
+
+# QEMU build artifacts
+build/
+*.mak
