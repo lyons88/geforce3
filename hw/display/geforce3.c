@@ -16,6 +16,7 @@
 #include "migration/vmstate.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
+#include "qemu/timer.h"
 #include "trace.h"
 #include "hw/display/vga.h"
 #include "hw/display/vga_int.h"
@@ -45,6 +46,43 @@ OBJECT_DECLARE_SIMPLE_TYPE(NVGFState, GEFORCE3)
 #define NV_PMC_INTR_0           0x000100
 #define NV_PMC_INTR_EN_0        0x000140
 #define NV_PBUS_PCI_NV_1        0x001804
+
+/* VBE (VESA BIOS Extensions) registers */
+#define VBE_DISPI_INDEX_ID              0x0
+#define VBE_DISPI_INDEX_XRES            0x1
+#define VBE_DISPI_INDEX_YRES            0x2
+#define VBE_DISPI_INDEX_BPP             0x3
+#define VBE_DISPI_INDEX_ENABLE          0x4
+#define VBE_DISPI_INDEX_BANK            0x5
+#define VBE_DISPI_INDEX_VIRT_WIDTH      0x6
+#define VBE_DISPI_INDEX_VIRT_HEIGHT     0x7
+#define VBE_DISPI_INDEX_X_OFFSET        0x8
+#define VBE_DISPI_INDEX_Y_OFFSET        0x9
+
+/* VBE mode enable flags */
+#define VBE_DISPI_DISABLED              0x00
+#define VBE_DISPI_ENABLED               0x01
+#define VBE_DISPI_GETCAPS               0x02
+#define VBE_DISPI_8BIT_DAC              0x20
+#define VBE_DISPI_LFB_ENABLED           0x40
+#define VBE_DISPI_NOCLEARMEM            0x80
+
+/* VBE mode limits */
+#define VBE_DISPI_MIN_XRES              64
+#define VBE_DISPI_MIN_YRES              64
+#define VBE_DISPI_MAX_XRES              2048
+#define VBE_DISPI_MAX_YRES              1536
+#define VBE_DISPI_MAX_BPP               32
+
+/* Supported BPP values */
+#define VBE_SUPPORTED_BPP_8             8
+#define VBE_SUPPORTED_BPP_15            15
+#define VBE_SUPPORTED_BPP_16            16
+#define VBE_SUPPORTED_BPP_24            24
+#define VBE_SUPPORTED_BPP_32            32
+
+/* MMIO logging rate limiting */
+#define MMIO_LOG_RATE_LIMIT_NS          1000000000  /* 1 second */
 
 /* NV20 (GeForce3) architecture constants */
 #define NV_ARCH_20              0x20
@@ -79,6 +117,21 @@ typedef struct NVGFState {
     /* VBE support */
     uint16_t vbe_index;
     uint16_t vbe_regs[16]; /* VBE register array */
+    uint16_t vbe_xres;
+    uint16_t vbe_yres;
+    uint16_t vbe_bpp;
+    uint16_t vbe_enable;
+    uint16_t vbe_virt_width;
+    uint16_t vbe_virt_height;
+    uint16_t vbe_x_offset;
+    uint16_t vbe_y_offset;
+    bool vbe_mode_changed;
+    
+    /* MMIO logging rate limiting */
+    int64_t last_mmio_log_time;
+    hwaddr last_mmio_addr;
+    uint64_t last_mmio_val;
+    bool mmio_log_suppress;
     
     /* NVIDIA-specific registers */
     uint32_t pmc_boot_0;
@@ -97,17 +150,231 @@ static void geforce_ui_info(void *opaque, uint32_t idx, QemuUIInfo *info);
 static uint32_t nv_compute_boot0(NVGFState *s);
 static void nv_apply_model_ids(NVGFState *s);
 static uint64_t nv_bar0_readl(void *opaque, hwaddr addr, unsigned size);
+static bool vbe_validate_mode(uint16_t xres, uint16_t yres, uint16_t bpp);
+static void vbe_update_display(NVGFState *s);
+static void vbe_sync_crtc(NVGFState *s);
+static bool should_log_mmio_access(NVGFState *s, hwaddr addr, uint64_t val);
+
+/* VBE mode validation */
+static bool vbe_validate_mode(uint16_t xres, uint16_t yres, uint16_t bpp)
+{
+    /* Check resolution limits */
+    if (xres < VBE_DISPI_MIN_XRES || xres > VBE_DISPI_MAX_XRES) {
+        return false;
+    }
+    if (yres < VBE_DISPI_MIN_YRES || yres > VBE_DISPI_MAX_YRES) {
+        return false;
+    }
+    
+    /* Check supported BPP values */
+    switch (bpp) {
+    case VBE_SUPPORTED_BPP_8:
+    case VBE_SUPPORTED_BPP_15:
+    case VBE_SUPPORTED_BPP_16:
+    case VBE_SUPPORTED_BPP_24:
+    case VBE_SUPPORTED_BPP_32:
+        break;
+    default:
+        return false;
+    }
+    
+    /* Calculate required VRAM and check bounds */
+    uint32_t bytes_per_pixel = (bpp + 7) / 8;
+    uint32_t pitch = (xres * bytes_per_pixel + 3) & ~3; /* 4-byte aligned */
+    uint64_t required_vram = (uint64_t)pitch * yres;
+    
+    /* Check if mode fits in VRAM (assume 16MB like NV_LFB_SIZE) */
+    if (required_vram > NV_LFB_SIZE) {
+        return false;
+    }
+    
+    return true;
+}
+
+/* Rate-limited MMIO logging */
+static bool should_log_mmio_access(NVGFState *s, hwaddr addr, uint64_t val)
+{
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    
+    /* Check if this is the same access as last time */
+    if (s->last_mmio_addr == addr && s->last_mmio_val == val) {
+        /* Check if enough time has passed since last log */
+        if (now - s->last_mmio_log_time < MMIO_LOG_RATE_LIMIT_NS) {
+            s->mmio_log_suppress = true;
+            return false;
+        }
+    }
+    
+    /* Log this access and update timestamps */
+    s->last_mmio_log_time = now;
+    s->last_mmio_addr = addr;
+    s->last_mmio_val = val;
+    
+    /* If we were suppressing, note that we're resuming */
+    if (s->mmio_log_suppress) {
+        s->mmio_log_suppress = false;
+        qemu_log_mask(LOG_GUEST_ERROR, "geforce3: [Resuming MMIO logging after rate limit]\n");
+    }
+    
+    return true;
+}
+
+/* VBE display update */
+static void vbe_update_display(NVGFState *s)
+{
+    VGACommonState *vga = &s->vga;
+    
+    if (!(s->vbe_enable & VBE_DISPI_ENABLED)) {
+        return;
+    }
+    
+    /* Calculate pitch with 4-byte alignment */
+    uint32_t bytes_per_pixel = (s->vbe_bpp + 7) / 8;
+    uint32_t pitch = (s->vbe_xres * bytes_per_pixel + 3) & ~3;
+    
+    /* Update VGA state with VBE parameters */
+    vga->vram_size_mb = NV_LFB_SIZE / (1024 * 1024);
+    
+    /* Trigger display refresh */
+    if (vga->con) {
+        dpy_gfx_update_full(vga->con);
+    }
+}
+
+/* VBE-CRTC synchronization */
+static void vbe_sync_crtc(NVGFState *s)
+{
+    if (!(s->vbe_enable & VBE_DISPI_ENABLED)) {
+        return;
+    }
+    
+    /* Sync pixel format with CRTC */
+    /* This would normally set CRTC pixel format registers */
+    /* For now, we mark that mode has changed */
+    s->vbe_mode_changed = true;
+    
+    /* Update display after CRTC sync */
+    vbe_update_display(s);
+}
 
 /* VGA I/O operations */
 static uint64_t geforce_vga_ioport_read(void *opaque, hwaddr addr, unsigned size)
 {
     NVGFState *s = opaque;
+    
+    /* Handle VBE register reads */
+    if (addr == 0x01ce) { /* VBE index register */
+        return s->vbe_index;
+    } else if (addr == 0x01cf) { /* VBE data register */
+        switch (s->vbe_index) {
+        case VBE_DISPI_INDEX_ID:
+            return 0x0002; /* VBE 2.0 compatible */
+        case VBE_DISPI_INDEX_XRES:
+            return s->vbe_xres;
+        case VBE_DISPI_INDEX_YRES:
+            return s->vbe_yres;
+        case VBE_DISPI_INDEX_BPP:
+            return s->vbe_bpp;
+        case VBE_DISPI_INDEX_ENABLE:
+            return s->vbe_enable;
+        case VBE_DISPI_INDEX_VIRT_WIDTH:
+            return s->vbe_virt_width;
+        case VBE_DISPI_INDEX_VIRT_HEIGHT:
+            return s->vbe_virt_height;
+        case VBE_DISPI_INDEX_X_OFFSET:
+            return s->vbe_x_offset;
+        case VBE_DISPI_INDEX_Y_OFFSET:
+            return s->vbe_y_offset;
+        default:
+            return 0;
+        }
+    }
+    
     return vga_ioport_read(&s->vga, addr);
 }
 
 static void geforce_vga_ioport_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
 {
     NVGFState *s = opaque;
+    
+    /* Handle VBE register writes */
+    if (addr == 0x01ce) { /* VBE index register */
+        s->vbe_index = val;
+        return;
+    } else if (addr == 0x01cf) { /* VBE data register */
+        switch (s->vbe_index) {
+        case VBE_DISPI_INDEX_XRES:
+            if (vbe_validate_mode(val, s->vbe_yres, s->vbe_bpp)) {
+                s->vbe_xres = val;
+                s->vbe_mode_changed = true;
+            } else {
+                qemu_log_mask(LOG_GUEST_ERROR, 
+                    "geforce3: Invalid VBE X resolution: %"PRId64"\n", val);
+            }
+            break;
+        case VBE_DISPI_INDEX_YRES:
+            if (vbe_validate_mode(s->vbe_xres, val, s->vbe_bpp)) {
+                s->vbe_yres = val;
+                s->vbe_mode_changed = true;
+            } else {
+                qemu_log_mask(LOG_GUEST_ERROR, 
+                    "geforce3: Invalid VBE Y resolution: %"PRId64"\n", val);
+            }
+            break;
+        case VBE_DISPI_INDEX_BPP:
+            if (vbe_validate_mode(s->vbe_xres, s->vbe_yres, val)) {
+                s->vbe_bpp = val;
+                s->vbe_mode_changed = true;
+            } else {
+                qemu_log_mask(LOG_GUEST_ERROR, 
+                    "geforce3: Invalid VBE BPP: %"PRId64"\n", val);
+            }
+            break;
+        case VBE_DISPI_INDEX_ENABLE:
+            s->vbe_enable = val;
+            if (val & VBE_DISPI_ENABLED) {
+                if (vbe_validate_mode(s->vbe_xres, s->vbe_yres, s->vbe_bpp)) {
+                    vbe_sync_crtc(s);
+                    qemu_log_mask(LOG_GUEST_ERROR, 
+                        "geforce3: VBE mode enabled: %dx%d@%d\n", 
+                        s->vbe_xres, s->vbe_yres, s->vbe_bpp);
+                } else {
+                    s->vbe_enable &= ~VBE_DISPI_ENABLED;
+                    qemu_log_mask(LOG_GUEST_ERROR, 
+                        "geforce3: VBE mode activation failed - invalid parameters\n");
+                }
+            }
+            break;
+        case VBE_DISPI_INDEX_VIRT_WIDTH:
+            if (val >= s->vbe_xres && val <= VBE_DISPI_MAX_XRES) {
+                s->vbe_virt_width = val;
+            } else {
+                qemu_log_mask(LOG_GUEST_ERROR, 
+                    "geforce3: Invalid VBE virtual width: %"PRId64"\n", val);
+            }
+            break;
+        case VBE_DISPI_INDEX_VIRT_HEIGHT:
+            if (val >= s->vbe_yres && val <= VBE_DISPI_MAX_YRES) {
+                s->vbe_virt_height = val;
+            } else {
+                qemu_log_mask(LOG_GUEST_ERROR, 
+                    "geforce3: Invalid VBE virtual height: %"PRId64"\n", val);
+            }
+            break;
+        case VBE_DISPI_INDEX_X_OFFSET:
+            s->vbe_x_offset = val;
+            break;
+        case VBE_DISPI_INDEX_Y_OFFSET:
+            s->vbe_y_offset = val;
+            break;
+        default:
+            qemu_log_mask(LOG_GUEST_ERROR, 
+                "geforce3: Unknown VBE register index: 0x%x\n", s->vbe_index);
+            break;
+        }
+        return;
+    }
+    
     vga_ioport_write(&s->vga, addr, val);
 }
 
@@ -155,34 +422,62 @@ static void nv_apply_model_ids(NVGFState *s)
 static uint64_t nv_bar0_readl(void *opaque, hwaddr addr, unsigned size)
 {
     NVGFState *s = opaque;
+    uint64_t ret;
     
     switch (addr) {
     case NV_PMC_BOOT_0:
         /* Critical register for nouveau chipset detection */
-        return s->pmc_boot_0;
+        ret = s->pmc_boot_0;
+        break;
         
     case NV_PMC_INTR_0:
         /* Interrupt status register */
-        return s->pmc_intr_0;
+        ret = s->pmc_intr_0;
+        break;
         
     case NV_PMC_INTR_EN_0:
         /* Interrupt enable register */
-        return s->pmc_intr_en_0;
+        ret = s->pmc_intr_en_0;
+        break;
         
     case NV_PBUS_PCI_NV_1:
         /* PCI configuration mirror */
-        return (NVIDIA_VENDOR_ID << 16) | GEFORCE3_DEVICE_ID;
+        ret = (NVIDIA_VENDOR_ID << 16) | GEFORCE3_DEVICE_ID;
+        break;
         
     default:
         /* For unhandled registers, check if it's in PRMVIO range */
         if (addr < NV_PRMVIO_SIZE) {
             uint32_t reg = addr / 4;
             if (reg < ARRAY_SIZE(s->prmvio)) {
-                return s->prmvio[reg];
+                ret = s->prmvio[reg];
+            } else {
+                ret = 0;
             }
+        } else {
+            ret = 0;
         }
-        return 0;
+        break;
     }
+    
+    /* Rate-limited logging for important register blocks */
+    if (should_log_mmio_access(s, addr, ret)) {
+        if (addr >= 0x000000 && addr < 0x001000) {
+            qemu_log_mask(LOG_GUEST_ERROR, "geforce3: PMC read 0x%06"HWADDR_PRIx" = 0x%08"PRIx64"\n", addr, ret);
+        } else if (addr >= 0x009000 && addr < 0x00A000) {
+            qemu_log_mask(LOG_GUEST_ERROR, "geforce3: PTIMER read 0x%06"HWADDR_PRIx" = 0x%08"PRIx64"\n", addr, ret);
+        } else if (addr >= 0x101000 && addr < 0x102000) {
+            qemu_log_mask(LOG_GUEST_ERROR, "geforce3: PEXTDEV read 0x%06"HWADDR_PRIx" = 0x%08"PRIx64"\n", addr, ret);
+        } else if (addr >= 0x400000 && addr < 0x402000) {
+            qemu_log_mask(LOG_GUEST_ERROR, "geforce3: PGRAPH read 0x%06"HWADDR_PRIx" = 0x%08"PRIx64"\n", addr, ret);
+        } else if (addr >= 0x600000 && addr < 0x601000) {
+            qemu_log_mask(LOG_GUEST_ERROR, "geforce3: PCRTC read 0x%06"HWADDR_PRIx" = 0x%08"PRIx64"\n", addr, ret);
+        } else if (addr >= 0x680000 && addr < 0x681000) {
+            qemu_log_mask(LOG_GUEST_ERROR, "geforce3: PRAMDAC read 0x%06"HWADDR_PRIx" = 0x%08"PRIx64"\n", addr, ret);
+        }
+    }
+    
+    return ret;
 }
 
 /* PRMVIO (VGA mirrors) operations */
@@ -195,6 +490,23 @@ static uint64_t geforce_prmvio_read(void *opaque, hwaddr addr, unsigned size)
 static void geforce_prmvio_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
 {
     NVGFState *s = opaque;
+    
+    /* Rate-limited logging for important register blocks */
+    if (should_log_mmio_access(s, addr, val)) {
+        if (addr >= 0x000000 && addr < 0x001000) {
+            qemu_log_mask(LOG_GUEST_ERROR, "geforce3: PMC write 0x%06"HWADDR_PRIx" = 0x%08"PRIx64"\n", addr, val);
+        } else if (addr >= 0x009000 && addr < 0x00A000) {
+            qemu_log_mask(LOG_GUEST_ERROR, "geforce3: PTIMER write 0x%06"HWADDR_PRIx" = 0x%08"PRIx64"\n", addr, val);
+        } else if (addr >= 0x101000 && addr < 0x102000) {
+            qemu_log_mask(LOG_GUEST_ERROR, "geforce3: PEXTDEV write 0x%06"HWADDR_PRIx" = 0x%08"PRIx64"\n", addr, val);
+        } else if (addr >= 0x400000 && addr < 0x402000) {
+            qemu_log_mask(LOG_GUEST_ERROR, "geforce3: PGRAPH write 0x%06"HWADDR_PRIx" = 0x%08"PRIx64"\n", addr, val);
+        } else if (addr >= 0x600000 && addr < 0x601000) {
+            qemu_log_mask(LOG_GUEST_ERROR, "geforce3: PCRTC write 0x%06"HWADDR_PRIx" = 0x%08"PRIx64"\n", addr, val);
+        } else if (addr >= 0x680000 && addr < 0x681000) {
+            qemu_log_mask(LOG_GUEST_ERROR, "geforce3: PRAMDAC write 0x%06"HWADDR_PRIx" = 0x%08"PRIx64"\n", addr, val);
+        }
+    }
     
     switch (addr) {
     case NV_PMC_INTR_0:
@@ -387,6 +699,24 @@ static void nv_realize(PCIDevice *pci_dev, Error **errp)
     /* Initialize NVIDIA-specific registers first */
     nv_apply_model_ids(s);
     
+    /* Initialize VBE registers with default values */
+    s->vbe_index = 0;
+    s->vbe_xres = 1024;
+    s->vbe_yres = 768;
+    s->vbe_bpp = 32;
+    s->vbe_enable = VBE_DISPI_DISABLED;
+    s->vbe_virt_width = 1024;
+    s->vbe_virt_height = 768;
+    s->vbe_x_offset = 0;
+    s->vbe_y_offset = 0;
+    s->vbe_mode_changed = false;
+    
+    /* Initialize MMIO logging rate limiting */
+    s->last_mmio_log_time = 0;
+    s->last_mmio_addr = 0;
+    s->last_mmio_val = 0;
+    s->mmio_log_suppress = false;
+    
     /* FIX: Initialize VGA - Add missing Error** parameter to vga_common_init call */
     vga_common_init(vga, OBJECT(s), errp);
     vga_init(vga, OBJECT(s), pci_address_space(pci_dev), 
@@ -456,5 +786,7 @@ static void geforce3_register_types(void)
 {
     type_register_static(&geforce3_info);
 }
+
+type_init(geforce3_register_types);
 
 type_init(geforce3_register_types);
