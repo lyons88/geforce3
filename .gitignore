@@ -1,0 +1,13 @@
+test_vbe
+test_vbe.c
+*.o
+*.so
+*.dylib
+build/
+dist/
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
