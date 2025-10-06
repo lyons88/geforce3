@@ -1,0 +1,21 @@
+# Gitignore for GeForce3 project
+
+# Build artifacts
+*.o
+*.so
+*.a
+test_edid
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Build directories
+build/
+dist/
