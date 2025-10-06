@@ -1,0 +1,19 @@
+# Build artifacts
+*.o
+*.so
+*.a
+test_geforce3_edid
+
+# Temporary files
+*~
+.tmp/
+/tmp/
+
+# IDE files
+.vscode/
+*.swp
+*.swo
+
+# System files
+.DS_Store
+Thumbs.db
