@@ -1,0 +1,19 @@
+# Compiled binaries
+test_edid
+*.o
+*.so
+*.a
+
+# Build artifacts
+build/
+dist/
+
+# Editor files
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
